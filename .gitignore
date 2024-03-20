@@ -1,2 +1,6 @@
 *
+!*/
 !*.md
+!*.cpp
+!*.cu
+!CMakeLists.txt
