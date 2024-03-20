@@ -1,0 +1,3 @@
+/home/aklice/WorkSpace/VSCode/LearnCUDAProgramming/My/Lab/Tests/VectorType/build/CMakeFiles/load_data.dir
+/home/aklice/WorkSpace/VSCode/LearnCUDAProgramming/My/Lab/Tests/VectorType/build/CMakeFiles/edit_cache.dir
+/home/aklice/WorkSpace/VSCode/LearnCUDAProgramming/My/Lab/Tests/VectorType/build/CMakeFiles/rebuild_cache.dir

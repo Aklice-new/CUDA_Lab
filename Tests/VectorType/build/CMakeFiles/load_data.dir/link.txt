@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/load_data.dir/load_data_generated_load_data.cu.o -o load_data  /usr/local/cuda-11.8/lib64/libcudart_static.a -ldl /usr/lib/x86_64-linux-gnu/librt.so -lpthread 
