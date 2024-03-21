@@ -111,6 +111,11 @@ __global__ void sgemm(float* __restrict__ A, float* __restrict__ B,
   do {
     tile_idx += BLOCK_SIZE_K;
     // double buffer 从全局内存中加载下一个tile  大循环
+    // 大循环是指，为了计算一个block bm * bn
+    // 将A矩阵的 bm * K 和B矩阵的 K * bn分别划分成 bm * bk 和 bk * bn 个小块
+    // 大循环里就是负责计算这些小块里的数据
+    // double buffer
+    // load next A_s
     if (tile_idx < K) {
 #pragma unroll
       for (int i = 0; i < BLOCK_SIZE_M; i += A_TILE_ROW_STRIDE) {
@@ -121,11 +126,80 @@ __global__ void sgemm(float* __restrict__ A, float* __restrict__ B,
         A_s[write_stage_idx][A_TILE_COL + 2][A_TILE_ROW_START + i] = data.z;
         A_s[write_stage_idx][A_TILE_COL + 3][A_TILE_ROW_START + i] = data.w;
       }
+      // load next B_s
+#pragma unroll
+      for (int i = 0; i < BLOCK_SIZE_N; i += B_TILE_ROW_STRIDE) {
+        FETCH_FLOAT4(B_s[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) =
+            FETCH_FLOAT4(
+                B[OFFSET(B_TILE_ROW_START + tile_idx + i, B_TILE_COL, N)]);
+      }
     }
-    // load next B_s
 
-    // compute
+    int load_stage_idx = write_stage_idx ^ 1;
 
-    // update
-  } while (1);
+    // 下面的内容就是小循环内完成的工作，
+    // 具体工作是完成从A_s 和 B_s中依次读入rm, rn个数据进入寄存器
+    // 然后把A_s 和 B_s中的数据加载到寄存器中
+    // 依次计算每一次 rm + rn 个数据对该线程负责的 rm * rn 个数据的贡献
+#pragma unroll
+    for (int j = 0; j < BLOCK_SIZE_K - 1; j++) {
+      // load next tile from shared mem to register
+      // from A_s to frag_a
+      for (int thread_y = 0; thread_y < THREAD_SIZE_Y; thread_y += 4) {
+        FETCH_FLOAT4(frag_a[(j + 1) % 2][thread_y]) = FETCH_FLOAT4(
+            A_s[load_stage_idx][j + 1][THREAD_SIZE_Y * ty + thread_y]);
+      }
+      // from B_s to frag_b
+      for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x += 4) {
+        FETCH_FLOAT4(frag_b[(j + 1) % 2][thread_x]) = FETCH_FLOAT4(
+            B_s[load_stage_idx][j + 1][THREAD_SIZE_X * tx + thread_x]);
+      }
+// compute THREAD_SIZE_X * THREAD_SIZE_Y
+#pragma unroll
+      for (int thread_y = 0; thread_y < THREAD_SIZE_Y; thread_y++) {
+#pragma unroll
+        for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x++) {
+          // accum 在每一次的小循环中保存的只是完整解的一部分
+          accum[thread_y][thread_x] +=
+              frag_a[j % 2][thread_y] * frag_b[j % 2][thread_x];
+        }
+      }
+    }
+
+    // 为了保证所有线程都完成对它负责的区域的数据的计算 需进行同步
+    __syncthreads();
+    // double buffer
+    write_stage_idx ^= 1;
+    // 最后在完成最后一次小的迭代，至于为什么要将8次小迭代分为7次加1次，原文作者说这样是为了隐藏延迟
+    // from A_s to frag_a
+    for (int thread_y = 0; thread_y < THREAD_SIZE_Y; thread_y += 4) {
+      FETCH_FLOAT4(frag_a[0][thread_y]) = FETCH_FLOAT4(
+          A_s[load_stage_idx ^ 1][0][THREAD_SIZE_Y * ty + thread_y]);
+    }
+    // from B_s to frag_b
+    for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x += 4) {
+      FETCH_FLOAT4(frag_b[0][thread_x]) = FETCH_FLOAT4(
+          B_s[load_stage_idx ^ 1][0][THREAD_SIZE_X * tx + thread_x]);
+    }
+// compute THREAD_SIZE_X * THREAD_SIZE_Y
+#pragma unroll
+    for (int thread_y = 0; thread_y < THREAD_SIZE_Y; thread_y++) {
+#pragma unroll
+      for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x++) {
+        // accum 在每一次的小循环中保存的只是完整解的一部分
+        accum[thread_y][thread_x] += frag_a[1][thread_y] * frag_b[1][thread_x];
+      }
+    }
+
+  } while (tile_idx < K);
+// 完成大循环后，该block中该线程负责的rm * rn的数据已经计算完成
+#pragma unroll
+  for (int thread_y = 0; thread_y < THREAD_SIZE_Y; thread_y++) {
+    for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x += 4) {
+      FETCH_FLOAT4(
+          C[OFFSET(BLOCK_SIZE_M * by + ty * THREAD_SIZE_Y + thread_y,
+                   BLOCK_SIZE_N * bx + tx * THREAD_SIZE_X + thread_x, N)]) =
+          FETCH_FLOAT4(accum[thread_y][thread_x]);
+    }
+  }
 }
