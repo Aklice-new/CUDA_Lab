@@ -23,7 +23,7 @@
 
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
 #define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
-#define FETECH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+#define FETECH_float4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define checkCudaErrors(func)                                                \
   {                                                                          \
     cudaError_t e = (func);                                                  \
@@ -173,10 +173,10 @@ __global__ void sgemm_v4(float* __restrict__ A,  //
     // load data from global memory to A_s and B_s
     // 每个线程负责将一部分数据从global memory中加载到shared memory中
 
-    FETECH_FLOAT4(A_s[a_row_start][a_col]) =
-        FETECH_FLOAT4(A[OFFSET(a_row_start, i * BLOCK_SIZE_K + a_col, K)]);
-    FETECH_FLOAT4(B_s[b_row_start][b_col]) =
-        FETECH_FLOAT4(B[OFFSET(i * BLOCK_SIZE_K + b_row_start, b_col, N)]);
+    FETECH_float4(A_s[a_row_start][a_col]) =
+        FETECH_float4(A[OFFSET(a_row_start, i * BLOCK_SIZE_K + a_col, K)]);
+    FETECH_float4(B_s[b_row_start][b_col]) =
+        FETECH_float4(B[OFFSET(i * BLOCK_SIZE_K + b_row_start, b_col, N)]);
 
     __syncthreads();
 
@@ -192,7 +192,7 @@ __global__ void sgemm_v4(float* __restrict__ A,  //
     }
     __syncthreads();
   }
-  // store to C
+  // store to
   for (int m = 0; m < THREAD_SIZE_M; m++) {
     for (int n = 0; n < THREAD_SIZE_N; n++) {
       if (row + ty * THREAD_SIZE_M + m < M &&
@@ -237,9 +237,9 @@ int main(int argc, char** argv) {
   checkCudaErrors(cudaMalloc(&d_A, bytes_A));
   checkCudaErrors(cudaMalloc(&d_B, bytes_B));
   checkCudaErrors(cudaMalloc(&d_C, bytes_C));
-  double msecPerMatrixMul[2] = {0, 0};
-  double gigaFlops[2] = {0, 0};
-  double flopsPerMatrixMul = 2.0 * M * N * K;
+  float msecPerMatrixMul[2] = {0, 0};
+  float gigaFlops[2] = {0, 0};
+  float flopsPerMatrixMul = 2.0 * M * N * K;
   // generate A
   for (int i = 0; i < M * K; i++) {
     h_A[i] = i / 13;
@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
   checkCudaErrors(cudaEventCreate(&start));
   checkCudaErrors(cudaEventCreate(&stop));
   float msecTotal = 0;
-  int nIter = 1;
+  int nIter = 1000;
 
   checkCudaErrors(cudaMemcpy(d_C, h_C, bytes_C, cudaMemcpyHostToDevice));
   checkCudaErrors(cudaEventRecord(start));
@@ -308,15 +308,15 @@ int main(int argc, char** argv) {
 
   cublasDestroy(blash_handle);
 
-  double eps = 1.e-6;  // machine zero
+  float eps = 1.e-6;  // machine zero
   bool correct = true;
   for (int i = 0; i < M * N; i++) {
     int row = i / N;
     int col = i % N;
-    double abs_err = fabs(h_C[i] - h_C1[col * M + row]);
-    double dot_length = M;
-    double abs_val = fabs(h_C[i]);
-    double rel_err = abs_err / abs_val / dot_length;
+    float abs_err = fabs(h_C[i] - h_C1[col * M + row]);
+    float dot_length = M;
+    float abs_val = fabs(h_C[i]);
+    float rel_err = abs_err / abs_val / dot_length;
     if (rel_err > eps) {
       printf("Error! Matrix[%d]=%.8f, ref=%.8f error term is > %E\n", i, h_C[i],
              h_C1[col * M + row], eps);
