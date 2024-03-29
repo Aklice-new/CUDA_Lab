@@ -2,8 +2,7 @@
  * @file reduction.cu
  * @author aklice
  * @brief
- 我们可以看到，在最后几次迭代中，线程数是小于32个的，所以这些线程是在同一个warp内进行的，我们可以
- 通过warp内不得函数来进行操作，从而减少同步的次数，提高效率
+  warp_shuffle指令进行优化
  * @version 0.1
  * @date 2024-03-28
  *
@@ -18,6 +17,8 @@
 #include <cstdlib>
 
 #define THREAD_PER_BLOCK 256
+#define NUM_PER_THREAD 2
+#define WARP_SIZE 32
 #define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
 #define checkCudaErrors(func)                                                  \
   {                                                                            \
@@ -26,43 +27,51 @@
       printf("%s %d CUDA: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
   }
 
-/**
- *  这里简单说一下cuda中的volatile关键词：
-    首先加了volatile关键词之后，就可以禁止编译器对代码的优化，
-    有时候可能会将共享内存优化为寄存器来优化读取，这种优化会导致一些问题，
-    如果a线程中的shm被优化为了register，那么它就只属于a线程，如果b线程这个时候进行了修改
-    此时，b的修改对a来说就不可见，会导致错误。
-    所以使用volatile的一般情况是：在使用共享内存的过程中，如果这些shm会被除当前线程之外的
-    线程修改，同时不加内存栅栏或者同步等操作，这时候就需要使用volatile关键词，禁止编译器的优化
- */
-__device__ void warpReduce(volatile float* sdata, int tid) {
-  sdata[tid] += sdata[tid + 32];
-  sdata[tid] += sdata[tid + 16];
-  sdata[tid] += sdata[tid + 8];
-  sdata[tid] += sdata[tid + 4];
-  sdata[tid] += sdata[tid + 2];
-  sdata[tid] += sdata[tid + 1];
+template <unsigned int BLOCK_SIZE>
+__device__ __forceinline__ float warpReduceSum(float sum) {
+  // __shfl_down_sync(mask, val, offset) warp 内高通道的值传递到低通道
+  if (BLOCK_SIZE >= 32) sum += __shfl_down_sync(0xffffffff, sum, 16);
+  if (BLOCK_SIZE >= 16) sum += __shfl_down_sync(0xffffffff, sum, 8);
+  if (BLOCK_SIZE >= 8) sum += __shfl_down_sync(0xffffffff, sum, 4);
+  if (BLOCK_SIZE >= 4) sum += __shfl_down_sync(0xffffffff, sum, 2);
+  if (BLOCK_SIZE >= 2) sum += __shfl_down_sync(0xffffffff, sum, 1);
+  return sum;
 }
 
+template <unsigned int BLOCK_SIZE>
 __global__ void reduction_kernel0(float* A, float* out) {
   int bx = blockIdx.x;
   int tx = threadIdx.x;
-  int tid = bx * blockDim.x * 2 + tx;  // 这里 blockDim.x * 2 = NUM_PER_BLOCK
-  __shared__ float A_s[THREAD_PER_BLOCK];
-  A_s[tx] = A[tid] + A[tid + blockDim.x];
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 32; stride /= 2) {
-    if (tx < stride) {
-      A_s[tx] += A_s[tx + stride];
-    }
-    __syncthreads();
+  int tid = bx * blockDim.x * NUM_PER_THREAD +
+            tx;   // 这里 blockDim.x * 2 = NUM_PER_BLOCK
+  float sum = 0;  // 记录当前线程块的和
+  // 先计算一下每个线程负责的数据的规约
+  for (int i = 0; i < NUM_PER_THREAD; i++) {
+    sum += A[tid + i * blockDim.x];
   }
-
-  if (tx < 32) {
-    warpReduce(A_s, tx);
+  // 接下来就是BLOCK_SIZE个线程的规约操作
+  // 我们先将BLOCK 分成多个warp来看待，首先计算warp内的规约
+  __shared__ float warpSum[WARP_SIZE];
+  int laneId = tx % WARP_SIZE;
+  int warpId = tx / WARP_SIZE;
+  // 计算该线程所在的warp的规约
+  // 在所有的warp中进行规约操作
+  sum = warpReduceSum<BLOCK_SIZE>(sum);
+  // 将结果合并warp sum中
+  if (laneId == 0) {
+    warpSum[warpId] = sum;
   }
+  // 通过blockDim.x / WARP_SIZE进行计算，得到warp_nums
+  // 然后让一些线程在负责对应warp的计算
+  // 所以这里有两步shuffle操作
+  sum = (tx < blockDim.x / WARP_SIZE) ? warpSum[laneId] : 0;
+  // 将warp中的所有结果保存在warp 0中
+  if (warpId == 0) {
+    sum = warpReduceSum<BLOCK_SIZE / WARP_SIZE>(sum);
+  }
+  // 将该block内的结果保存至最终结果
   if (tx == 0) {
-    out[bx] = A_s[tx];
+    out[bx] = sum;
   }
 }
 
@@ -72,7 +81,7 @@ int main() {
   h_A = (float*)malloc(N * sizeof(float));
   float* d_A;
   checkCudaErrors(cudaMalloc((void**)&d_A, N * sizeof(float)));
-  int NUM_PER_BLOCK = 2 * THREAD_PER_BLOCK;
+  int NUM_PER_BLOCK = NUM_PER_THREAD * THREAD_PER_BLOCK;
   int block_num = N / NUM_PER_BLOCK;
   float* d_out;
   checkCudaErrors(cudaMalloc((void**)&d_out, block_num * sizeof(float)));
@@ -103,7 +112,8 @@ int main() {
   checkCudaErrors(cudaEventCreate(&stop));
   checkCudaErrors(cudaEventRecord(start, 0));
   for (int i = 0; i < nIter; i++) {
-    reduction_kernel0<<<block_per_grid, threads_per_block>>>(d_A, d_out);
+    reduction_kernel0<THREAD_PER_BLOCK>
+        <<<block_per_grid, threads_per_block>>>(d_A, d_out);
   }
   checkCudaErrors(cudaEventRecord(stop, 0));
   checkCudaErrors(cudaEventSynchronize(stop));

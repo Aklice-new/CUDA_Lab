@@ -2,8 +2,7 @@
  * @file reduction.cu
  * @author aklice
  * @brief
- 我们可以看到，在最后几次迭代中，线程数是小于32个的，所以这些线程是在同一个warp内进行的，我们可以
- 通过warp内不得函数来进行操作，从而减少同步的次数，提高效率
+  展开for循环，交给编译器去优化
  * @version 0.1
  * @date 2024-03-28
  *
@@ -35,15 +34,17 @@
     所以使用volatile的一般情况是：在使用共享内存的过程中，如果这些shm会被除当前线程之外的
     线程修改，同时不加内存栅栏或者同步等操作，这时候就需要使用volatile关键词，禁止编译器的优化
  */
+template <unsigned int BLOCK_SIZE>
 __device__ void warpReduce(volatile float* sdata, int tid) {
-  sdata[tid] += sdata[tid + 32];
-  sdata[tid] += sdata[tid + 16];
-  sdata[tid] += sdata[tid + 8];
-  sdata[tid] += sdata[tid + 4];
-  sdata[tid] += sdata[tid + 2];
-  sdata[tid] += sdata[tid + 1];
+  if (BLOCK_SIZE >= 64) sdata[tid] += sdata[tid + 32];
+  if (BLOCK_SIZE >= 32) sdata[tid] += sdata[tid + 16];
+  if (BLOCK_SIZE >= 16) sdata[tid] += sdata[tid + 8];
+  if (BLOCK_SIZE >= 8) sdata[tid] += sdata[tid + 4];
+  if (BLOCK_SIZE >= 4) sdata[tid] += sdata[tid + 2];
+  if (BLOCK_SIZE >= 2) sdata[tid] += sdata[tid + 1];
 }
 
+template <unsigned int BLOCK_SIZE>
 __global__ void reduction_kernel0(float* A, float* out) {
   int bx = blockIdx.x;
   int tx = threadIdx.x;
@@ -51,15 +52,27 @@ __global__ void reduction_kernel0(float* A, float* out) {
   __shared__ float A_s[THREAD_PER_BLOCK];
   A_s[tx] = A[tid] + A[tid + blockDim.x];
   __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 32; stride /= 2) {
-    if (tx < stride) {
-      A_s[tx] += A_s[tx + stride];
+
+  if (BLOCK_SIZE >= 512) {
+    if (tx < 256) {
+      A_s[tx] += A_s[tx + 256];
     }
     __syncthreads();
   }
-
+  if (BLOCK_SIZE >= 256) {
+    if (tx < 128) {
+      A_s[tx] += A_s[tx + 128];
+    }
+    __syncthreads();
+  }
+  if (BLOCK_SIZE >= 128) {
+    if (tx < 64) {
+      A_s[tx] += A_s[tx + 64];
+    }
+    __syncthreads();
+  }
   if (tx < 32) {
-    warpReduce(A_s, tx);
+    warpReduce<BLOCK_SIZE>(A_s, tx);
   }
   if (tx == 0) {
     out[bx] = A_s[tx];
@@ -103,7 +116,8 @@ int main() {
   checkCudaErrors(cudaEventCreate(&stop));
   checkCudaErrors(cudaEventRecord(start, 0));
   for (int i = 0; i < nIter; i++) {
-    reduction_kernel0<<<block_per_grid, threads_per_block>>>(d_A, d_out);
+    reduction_kernel0<THREAD_PER_BLOCK>
+        <<<block_per_grid, threads_per_block>>>(d_A, d_out);
   }
   checkCudaErrors(cudaEventRecord(stop, 0));
   checkCudaErrors(cudaEventSynchronize(stop));
